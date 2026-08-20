@@ -1,0 +1,102 @@
+============================================================================
+1. EXPLANATION TRACE  (the CS-agent and merchant-debug surface)
+============================================================================
+cart subtotal           $118.96
+shipping                  $7.99
+
+promotions considered:
+  APPLIED  BOGO-TEE
+  APPLIED  HOME-15
+  APPLIED  ORDER-20
+  APPLIED  SHIP-FREE-50
+  rejected FIRST-ORDER-25           not_first_order
+  rejected SEASONAL-10OFF           stack_class_conflict:seasonal
+
+application trace (canonical order):
+  BOGO-TEE       item      bogo           -> $24.99
+       line 0 TEE-BLUE       -$24.99
+  HOME-15        category  percent_off    -> $3.75
+       line 1 MUG            -$3.75
+  ORDER-20       order     percent_off    -> $18.05
+       line 0 TEE-BLUE       -$10.00
+       line 1 MUG            -$4.25
+       line 2 COFFEE-1KG     -$3.80
+  SHIP-FREE-50   shipping  free_shipping  -> $7.99
+       shipping        -$7.99
+
+line 0 TEE-BLUE       qty 3       $74.97 - $34.99     =     $39.98
+line 1 MUG            qty 2       $25.00 - $8.00      =     $17.00
+line 2 COFFEE-1KG     qty 1       $18.99 - $3.80      =     $15.19
+shipping paid             $0.00
+TOTAL                    $72.17
+
+Note SEASONAL-10OFF: rejected, not silently dropped. It shares the
+'seasonal' stacking class with ORDER-20, which sorted first. Every
+promotion in the catalogue is either applied or carries a reason --
+that is asserted as a property, because a promo that vanishes without
+explanation is the single most common promotions support escalation.
+
+Reconciliation check on this cart:
+  sum of line discounts   $46.79
+  subtotal - paid         $46.79
+  exact to the cent: yes
+
+============================================================================
+2. EVALUATION LATENCY vs THE CHECKOUT BUDGET
+============================================================================
+ active promos    p50 ms    p95 ms    p99 ms    max ms  vs budget
+            10     0.230     0.352     0.725     1.191         OK
+            50     1.064     1.666     2.146     2.949         OK
+           100     0.930     1.925     2.863     3.085         OK
+           250     5.537     8.702    10.219    10.857         OK
+           500    10.400    16.773    20.172    20.834         OK
+
+Checkout budget for promotions: 25 ms at p99.
+
+Evaluation is O(promos x lines) with no index: every promotion in the
+catalogue is tested for eligibility against every cart. That is honest
+about where this would break -- the scaling is linear in catalogue
+size, so the number above is a measurement of THIS implementation, not
+a claim about promotion engines. The fix when it stops fitting is a
+pre-compiled eligibility index (category -> candidate promos) plus
+caching of the compiled catalogue; neither is built here.
+
+============================================================================
+3. BUDGET CAPS UNDER CONCURRENCY
+============================================================================
+check-and-increment               cap    granted    overspend
+unsynchronised (naive)           1000       4000        +3000
+under lock                       1000       1000           +0
+
+16 threads, 4,000 attempted redemptions against a 1,000 cap.
+
+The naive version is the same defect as decrement-and-hope inventory:
+eligibility is CHECKED and the counter is INCREMENTED in two steps, so
+two threads both read 999 and both redeem. Every redemption past the
+cap is margin given away that no merchant authorised.
+
+HONEST LIMIT OF THIS DEMONSTRATION: the guarded version holds a
+process-local mutex, which is only correct because this is one process.
+A real deployment needs the check and the increment to be one atomic
+operation in shared state -- a conditional UPDATE with a WHERE clause on
+the remaining count, the same mechanism SE-1 uses for stock. The mutex
+here demonstrates the failure and the shape of the fix, not the fix.
+
+============================================================================
+4. MERCHANT DRAFT-PROMO SIMULATOR
+============================================================================
+'What would this cart cost if I shipped this draft?' -- the tool every
+promo team asks for, so they can see the interaction before customers do.
+
+  without draft   $72.17
+  with draft      $63.67
+  delta           -$8.50
+
+  applied without: BOGO-TEE, HOME-15, ORDER-20, SHIP-FREE-50
+  applied with:    BOGO-TEE, DRAFT-BOGO-MUG, HOME-15, ORDER-20, SHIP-FREE-50
+  newly rejected because of the draft: none
+
+That last line is the point of the tool. A draft promotion does not
+only add its own discount -- it can knock an existing promotion out of
+the cart through exclusivity or a shared stacking class, and the
+merchant needs to see that before the sale starts, not after.
