@@ -45,11 +45,11 @@ Reconciliation check on this cart:
 2. EVALUATION LATENCY vs THE CHECKOUT BUDGET
 ============================================================================
  active promos    p50 ms    p95 ms    p99 ms    max ms  vs budget
-            10     0.230     0.352     0.725     1.191         OK
-            50     1.064     1.666     2.146     2.949         OK
-           100     0.930     1.925     2.863     3.085         OK
-           250     5.537     8.702    10.219    10.857         OK
-           500    10.400    16.773    20.172    20.834         OK
+            10     0.231     0.920     3.604     6.198         OK
+            50     1.106     2.244     8.082     9.069         OK
+           100     1.134     3.643     6.872     9.126         OK
+           250     6.078    11.168    17.072    19.784         OK
+           500    15.473    33.191    50.214    58.823       OVER
 
 Checkout budget for promotions: 25 ms at p99.
 
@@ -60,6 +60,59 @@ size, so the number above is a measurement of THIS implementation, not
 a claim about promotion engines. The fix when it stops fitting is a
 pre-compiled eligibility index (category -> candidate promos) plus
 caching of the compiled catalogue; neither is built here.
+
+============================================================================
+2b. THE ELIGIBILITY INDEX -- THE STATED FIX, NOW MEASURED
+============================================================================
+The latency table above scales linearly in catalogue size because
+every promotion is tested against every cart. The README named the
+fix -- a pre-compiled eligibility index -- and did not build it.
+Here it is, and the first thing it has to prove is that it does not
+change any answer.
+
+                     universal  scoped  mean_candidates  naive_p99  indexed_p99    speedup  compile_ms  answer_mismatches
+shape        promos                                                                                                      
+broad-match  100            67      33           88.260     21.358       26.418      0.808       0.290                  0
+             500           336     164          439.327     31.296       28.377      1.103       1.612                  0
+             2000         1297     703         1669.877    124.927      144.110      0.867       8.822                  0
+sku-targeted 100             0     100           14.497     27.779       30.814      0.901       0.402                  0
+             500             0     500           63.453     25.739       16.901      1.523       1.658                  0
+             2000            0    2000          236.603     47.942       21.919      2.187       5.952                  0
+
+answer_mismatches across 1,800 carts x 6 catalogues: 0
+An index that changes the answer is not an optimisation, it is a
+bug. Equality against the unindexed path is asserted as a property
+test over generated carts, not just spot-checked here.
+
+WHAT THE INDEX CAN AND CANNOT PRUNE, which is the honest read of the
+`universal` column: promotions with no category or SKU restriction
+could apply to any cart, so they survive every prune. Order-level
+percentages, free shipping and first-order offers are all universal,
+and they are common. The index makes the SCOPED tail nearly free and
+does nothing for the universal head -- so the speedup is a function
+of catalogue COMPOSITION, not catalogue size. A merchant whose
+promotions are all order-level gets no benefit at all, and that is
+worth knowing before promising a latency number.
+
+THE TWO CATALOGUE SHAPES ARE THE RESULT. `broad-match` is the
+generator from section 2, where promotions carry few restrictions and
+nearly every one is a candidate for every cart -- the index prunes
+almost nothing and its bookkeeping makes things marginally WORSE.
+`sku-targeted` is what a real retailer's catalogue looks like, because
+most promotions are funded by a specific vendor or clear a specific
+overstock. There the candidate set collapses and the index pays.
+
+So the honest claim is NOT 'indexing makes promo evaluation Nx
+faster'. It is: indexing converts the cost from catalogue SIZE to
+catalogue BREADTH, and whether that helps is a property of the
+merchant's promotions, not of the engine. Shipping this without
+measuring the customer's actual catalogue composition would be
+shipping a benchmark, not an improvement.
+
+Compile cost (5.95 ms at 2,000 promos) is paid when a merchant edits
+the catalogue, not per checkout. That amortisation is the other half
+of the win and the reason the compiled object is a separate class
+rather than work done inside evaluate().
 
 ============================================================================
 3. BUDGET CAPS UNDER CONCURRENCY
@@ -83,6 +136,49 @@ the remaining count, the same mechanism SE-1 uses for stock. The mutex
 here demonstrates the failure and the shape of the fix, not the fix.
 
 ============================================================================
+3b. BUDGET CAPS IN SHARED STATE -- THE ACTUAL FIX
+============================================================================
+Section 3 showed the race and guarded it with a process-local mutex,
+then said plainly that a mutex is not the fix. It is not: two checkout
+pods do not share a Python lock, so a 1,000-redemption promotion
+issues 1,000 PER POD.
+
+The fix is the same one SE-1 uses for stock -- make the check and the
+decrement ONE conditional statement in the shared store:
+
+    UPDATE promo_budget SET remaining = remaining - 1
+     WHERE promo_id = ? AND remaining > 0
+
+24 threads, 6000 attempted redemptions, cap 1000, no application lock:
+  granted            1000
+  remaining in store 0
+  redemption rows    1000
+  overspend          +0
+  ledger drift       none
+  wall               1.87s (3209 claims/s)
+
+Exactly 1000 granted with no application-level lock anywhere. The
+precondition rides in the WHERE clause, so there is no window between
+the check and the decrement -- because there is no check.
+
+PER-CUSTOMER LIMIT, same shape, 12 threads racing for ONE customer's
+single allowed redemption (600 attempts):
+  granted 1  (limit 1)
+
+The per-customer check cannot be conditional in the UPDATE -- it is a
+COUNT over a different table -- so that one genuinely needs the
+transaction, and BEGIN IMMEDIATE is what makes it safe. Two different
+mechanisms for two different shapes of constraint, rather than one
+lock hopefully covering both.
+
+RELEASE PATH: a redemption claimed at price-quote time and then
+abandoned at payment must go back. Without it every abandoned
+checkout permanently burns a redemption and a 1,000-redemption
+promotion silently becomes a 600-redemption one.
+  remaining 0 -> release -> 1 (first call True, retry False)
+  ledger drift after release: none
+
+============================================================================
 4. MERCHANT DRAFT-PROMO SIMULATOR
 ============================================================================
 'What would this cart cost if I shipped this draft?' -- the tool every
@@ -100,3 +196,52 @@ That last line is the point of the tool. A draft promotion does not
 only add its own discount -- it can knock an existing promotion out of
 the cart through exclusivity or a shared stacking class, and the
 merchant needs to see that before the sale starts, not after.
+
+============================================================================
+4b. TAX -- WHY IT COULD NOT STAY OUT OF THE ENGINE
+============================================================================
+The README listed tax as absent and called it 'not a small omission'.
+It is now computed per line, on the POST-DISCOUNT amount.
+
+Cart: taxable apparel + EXEMPT groceries + taxable electronics,
+with a single 20%-off-order promotion allocated across all three.
+
+line                gross   discount       paid   tax bp        tax
+TEE-BLUE           $49.98    -$10.00     $39.98      875      $3.50
+MILK               $13.47     -$2.69     $10.78        0      $0.00
+HEADPHONES         $89.99    -$18.00     $71.99      875      $6.30
+TOTAL             $153.44    -$30.69    $122.75               $9.80
+TOTAL PAID                                         $132.55
+
+A single cart-level rate would have charged $10.74 of tax instead of
+$9.80 -- a $0.94 error on one cart, because it taxes the exempt
+groceries. There is no single correct cart rate when the lines
+differ, which is precisely why the order-level discount has to be
+ALLOCATED to lines before tax can be computed at all.
+
+THAT IS THE LOAD-BEARING CONNECTION between this project and SE-1:
+the same per-line allocation that makes tax computable is what makes
+a partial refund computable. Get the allocation wrong and you are
+wrong twice, in two different systems, months apart.
+
+DISCOUNT-THEN-TAX vs TAX-THEN-DISCOUNT is a real choice and this
+engine has made it: tax applies to what the customer actually pays,
+because a RETAILER discount reduces the taxable receipt. A
+MANUFACTURER coupon generally does not -- the retailer is reimbursed,
+so the taxable amount stays at full price. That case is NOT modelled
+here, and an engine that has not chosen is doing both by accident.
+
+============================================================================
+4c. SCHEDULED ACTIVATION AND EXPIRY
+============================================================================
+  t=   500  before window   total $49.98   rejected: not_yet_active
+  t=  1500  inside window   total $34.99   APPLIED
+  t=  2500  after window    total $49.98   rejected: expired
+
+The window is enforced in the ENGINE, not by a cron job that flips an
+active flag. That matters because a flag has a moment of being wrong:
+the job runs late, or runs twice, or the pod that owns it restarts,
+and a sale goes live early to whoever happens to check out then.
+Evaluating the timestamp per cart has no such window, and it also
+makes the merchant simulator able to answer 'what would this cart
+cost on Friday' -- which is the question they actually ask.

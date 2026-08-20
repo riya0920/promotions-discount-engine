@@ -19,7 +19,11 @@ import statistics
 import threading
 import time
 
+import pandas as pd
+
+from src import budget as BUD
 from src.engine import evaluate, explain
+from src.index import CompiledCatalogue, evaluate_indexed
 from src.model import (Cart, Eligibility, EffectKind, Line, Promotion, Scope,
                        Stacking)
 from src.money import fmt
@@ -78,6 +82,33 @@ def random_catalogue(n, rng):
             tier_threshold_cents=rng.choice([0, 5000, 10000]),
             stacking=rng.choice([Stacking.STACKABLE] * 9 + [Stacking.EXCLUSIVE]),
             stack_class=rng.choice(["", "", "", "seasonal", "loyalty"]),
+            priority=rng.randint(1, 200)))
+    return promos
+
+
+def sku_targeted_catalogue(n, rng):
+    """A catalogue shaped like a real retailer's: most promotions target specific
+    products, because most promotions are funded by a specific vendor or clearing
+    a specific overstock. `random_catalogue` above is the opposite extreme --
+    nearly everything broad-match -- and reporting both is the point, because the
+    index's value lives entirely in this difference."""
+    promos = []
+    for i in range(n):
+        kind = rng.choice([EffectKind.PERCENT_OFF, EffectKind.AMOUNT_OFF,
+                           EffectKind.BOGO])
+        scope = Scope.ITEM if rng.random() < 0.85 else Scope.CATEGORY
+        if scope is Scope.ITEM:
+            el = Eligibility(skus=frozenset(
+                "SKU%03d" % rng.randint(0, 200) for _ in range(rng.randint(1, 3))))
+        else:
+            el = Eligibility(categories=frozenset([rng.choice(CATEGORIES)]))
+        promos.append(Promotion(
+            "T%04d" % i, scope, kind, eligibility=el,
+            percent_bp=rng.choice([500, 1000, 1500, 2000]),
+            amount_cents=rng.choice([200, 500, 1000]),
+            bogo=(rng.randint(1, 3), 1),
+            stacking=Stacking.STACKABLE,
+            stack_class=rng.choice(["", "", "", "vendor"]),
             priority=rng.randint(1, 200)))
     return promos
 
@@ -160,6 +191,301 @@ def section_latency(lines, summary):
     lines.append("caching of the compiled catalogue; neither is built here.")
     summary["latency"] = rows
     return rows
+
+
+def section_index(lines, summary):
+    lines.append("")
+    lines.append("=" * 76)
+    lines.append("2b. THE ELIGIBILITY INDEX -- THE STATED FIX, NOW MEASURED")
+    lines.append("=" * 76)
+    lines.append("The latency table above scales linearly in catalogue size because")
+    lines.append("every promotion is tested against every cart. The README named the")
+    lines.append("fix -- a pre-compiled eligibility index -- and did not build it.")
+    lines.append("Here it is, and the first thing it has to prove is that it does not")
+    lines.append("change any answer.")
+    lines.append("")
+    rng = random.Random(23)
+    rows = []
+    for shape, maker in (("broad-match", random_catalogue),
+                         ("sku-targeted", sku_targeted_catalogue)):
+      for n_promos in (100, 500, 2000):
+        cat = maker(n_promos, rng)
+        compiled = CompiledCatalogue(cat)
+        carts = [random_cart(rng) for _ in range(300)]
+
+        mismatches = 0
+        for c in carts:
+            if evaluate(c, cat).total_paid != evaluate_indexed(c, compiled).total_paid:
+                mismatches += 1
+
+        for c in carts[:20]:
+            evaluate(c, cat)
+            evaluate_indexed(c, compiled)
+
+        t_naive, t_idx, cand = [], [], []
+        for c in carts:
+            t0 = time.perf_counter()
+            evaluate(c, cat)
+            t_naive.append((time.perf_counter() - t0) * 1000)
+            t0 = time.perf_counter()
+            evaluate_indexed(c, compiled)
+            t_idx.append((time.perf_counter() - t0) * 1000)
+            cand.append(len(compiled.candidates(c)))
+        t_naive.sort()
+        t_idx.sort()
+
+        t0 = time.perf_counter()
+        CompiledCatalogue(cat)
+        compile_ms = (time.perf_counter() - t0) * 1000
+
+        st = compiled.stats()
+        rows.append(dict(
+            shape=shape,
+            promos=n_promos, universal=st["universal"], scoped=st["scoped"],
+            mean_candidates=statistics.mean(cand),
+            naive_p99=t_naive[int(0.99 * len(t_naive))],
+            indexed_p99=t_idx[int(0.99 * len(t_idx))],
+            speedup=t_naive[int(0.99 * len(t_naive))] / max(t_idx[int(0.99 * len(t_idx))], 1e-9),
+            compile_ms=compile_ms, answer_mismatches=mismatches))
+    T = pd.DataFrame(rows).set_index(["shape", "promos"])
+    lines.append(T.to_string(float_format=lambda x: "%10.3f" % x))
+    lines.append("")
+    total_mismatch = int(T.answer_mismatches.sum())
+    lines.append("answer_mismatches across 1,800 carts x 6 catalogues: %d"
+                 % total_mismatch)
+    if total_mismatch == 0:
+        lines.append("An index that changes the answer is not an optimisation, it is a")
+        lines.append("bug. Equality against the unindexed path is asserted as a property")
+        lines.append("test over generated carts, not just spot-checked here.")
+    lines.append("")
+    lines.append("WHAT THE INDEX CAN AND CANNOT PRUNE, which is the honest read of the")
+    lines.append("`universal` column: promotions with no category or SKU restriction")
+    lines.append("could apply to any cart, so they survive every prune. Order-level")
+    lines.append("percentages, free shipping and first-order offers are all universal,")
+    lines.append("and they are common. The index makes the SCOPED tail nearly free and")
+    lines.append("does nothing for the universal head -- so the speedup is a function")
+    lines.append("of catalogue COMPOSITION, not catalogue size. A merchant whose")
+    lines.append("promotions are all order-level gets no benefit at all, and that is")
+    lines.append("worth knowing before promising a latency number.")
+    lines.append("")
+    lines.append("THE TWO CATALOGUE SHAPES ARE THE RESULT. `broad-match` is the")
+    lines.append("generator from section 2, where promotions carry few restrictions and")
+    lines.append("nearly every one is a candidate for every cart -- the index prunes")
+    lines.append("almost nothing and its bookkeeping makes things marginally WORSE.")
+    lines.append("`sku-targeted` is what a real retailer's catalogue looks like, because")
+    lines.append("most promotions are funded by a specific vendor or clear a specific")
+    lines.append("overstock. There the candidate set collapses and the index pays.")
+    lines.append("")
+    lines.append("So the honest claim is NOT 'indexing makes promo evaluation Nx")
+    lines.append("faster'. It is: indexing converts the cost from catalogue SIZE to")
+    lines.append("catalogue BREADTH, and whether that helps is a property of the")
+    lines.append("merchant's promotions, not of the engine. Shipping this without")
+    lines.append("measuring the customer's actual catalogue composition would be")
+    lines.append("shipping a benchmark, not an improvement.")
+    lines.append("")
+    lines.append("Compile cost (%.2f ms at 2,000 promos) is paid when a merchant edits"
+                 % T.loc[("sku-targeted", 2000), "compile_ms"])
+    lines.append("the catalogue, not per checkout. That amortisation is the other half")
+    lines.append("of the win and the reason the compiled object is a separate class")
+    lines.append("rather than work done inside evaluate().")
+    summary["eligibility_index"] = T.reset_index().round(4).to_dict("records")
+
+
+def section_atomic_budget(lines, summary):
+    lines.append("")
+    lines.append("=" * 76)
+    lines.append("3b. BUDGET CAPS IN SHARED STATE -- THE ACTUAL FIX")
+    lines.append("=" * 76)
+    lines.append("Section 3 showed the race and guarded it with a process-local mutex,")
+    lines.append("then said plainly that a mutex is not the fix. It is not: two checkout")
+    lines.append("pods do not share a Python lock, so a 1,000-redemption promotion")
+    lines.append("issues 1,000 PER POD.")
+    lines.append("")
+    lines.append("The fix is the same one SE-1 uses for stock -- make the check and the")
+    lines.append("decrement ONE conditional statement in the shared store:")
+    lines.append("")
+    lines.append("    UPDATE promo_budget SET remaining = remaining - 1")
+    lines.append("     WHERE promo_id = ? AND remaining > 0")
+    lines.append("")
+    db = os.path.join(OUT, "budget.db")
+    CAP, THREADS, ATTEMPTS = 1000, 24, 6000
+    con = BUD.init(db, fresh=True)
+    BUD.register(con, "CAPPED-10", CAP)
+    con.close()
+
+    granted, lock = [], threading.Lock()
+    barrier = threading.Barrier(THREADS)
+
+    def worker(w):
+        c = BUD.connect(db)
+        got = 0
+        barrier.wait()
+        for i in range(ATTEMPTS // THREADS):
+            if BUD.claim(c, "CAPPED-10", "cust%d" % (w * 1000 + i), now=0.0):
+                got += 1
+        c.close()
+        with lock:
+            granted.append(got)
+
+    ts = [threading.Thread(target=worker, args=(w,)) for w in range(THREADS)]
+    t0 = time.perf_counter()
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    wall = time.perf_counter() - t0
+
+    con = BUD.connect(db)
+    row = con.execute("SELECT cap, remaining FROM promo_budget").fetchone()
+    n_red = con.execute("SELECT COUNT(*) n FROM redemptions").fetchone()["n"]
+    drift = BUD.check_drift(con)
+    lines.append("%d threads, %d attempted redemptions, cap %d, no application lock:"
+                 % (THREADS, ATTEMPTS, CAP))
+    lines.append("  granted            %d" % sum(granted))
+    lines.append("  remaining in store %d" % row["remaining"])
+    lines.append("  redemption rows    %d" % n_red)
+    lines.append("  overspend          %+d" % (sum(granted) - CAP))
+    lines.append("  ledger drift       %s" % (drift or "none"))
+    lines.append("  wall               %.2fs (%.0f claims/s)" % (wall, ATTEMPTS / wall))
+    lines.append("")
+    lines.append("Exactly %d granted with no application-level lock anywhere. The" % CAP)
+    lines.append("precondition rides in the WHERE clause, so there is no window between")
+    lines.append("the check and the decrement -- because there is no check.")
+    lines.append("")
+
+    con2 = BUD.init(db + "2", fresh=True)
+    BUD.register(con2, "ONE-EACH", 100000)
+    con2.close()
+    per_cust_granted, lock2 = [], threading.Lock()
+    barrier2 = threading.Barrier(12)
+
+    def worker2(w):
+        c = BUD.connect(db + "2")
+        got = 0
+        barrier2.wait()
+        for _ in range(50):
+            if BUD.claim(c, "ONE-EACH", "the-same-customer",
+                         per_customer_limit=1, now=0.0):
+                got += 1
+        c.close()
+        with lock2:
+            per_cust_granted.append(got)
+
+    ts2 = [threading.Thread(target=worker2, args=(w,)) for w in range(12)]
+    for t in ts2:
+        t.start()
+    for t in ts2:
+        t.join()
+    lines.append("PER-CUSTOMER LIMIT, same shape, 12 threads racing for ONE customer's")
+    lines.append("single allowed redemption (600 attempts):")
+    lines.append("  granted %d  (limit 1)" % sum(per_cust_granted))
+    lines.append("")
+    lines.append("The per-customer check cannot be conditional in the UPDATE -- it is a")
+    lines.append("COUNT over a different table -- so that one genuinely needs the")
+    lines.append("transaction, and BEGIN IMMEDIATE is what makes it safe. Two different")
+    lines.append("mechanisms for two different shapes of constraint, rather than one")
+    lines.append("lock hopefully covering both.")
+    lines.append("")
+    lines.append("RELEASE PATH: a redemption claimed at price-quote time and then")
+    lines.append("abandoned at payment must go back. Without it every abandoned")
+    lines.append("checkout permanently burns a redemption and a 1,000-redemption")
+    lines.append("promotion silently becomes a 600-redemption one.")
+    c3 = BUD.connect(db)
+    before = c3.execute("SELECT remaining FROM promo_budget").fetchone()["remaining"]
+    rid = c3.execute("SELECT redemption_id FROM redemptions LIMIT 1").fetchone()[0]
+    ok1 = BUD.release(c3, "CAPPED-10", rid)
+    ok2 = BUD.release(c3, "CAPPED-10", rid)
+    after = c3.execute("SELECT remaining FROM promo_budget").fetchone()["remaining"]
+    lines.append("  remaining %d -> release -> %d (first call %s, retry %s)"
+                 % (before, after, ok1, ok2))
+    lines.append("  ledger drift after release: %s" % (BUD.check_drift(c3) or "none"))
+    summary["atomic_budget"] = dict(
+        cap=CAP, attempts=ATTEMPTS, granted=int(sum(granted)),
+        overspend=int(sum(granted) - CAP), drift=drift,
+        per_customer_granted=int(sum(per_cust_granted)),
+        release_idempotent=bool(ok1 and not ok2))
+    con.close()
+    c3.close()
+
+
+def section_tax(lines, summary):
+    lines.append("")
+    lines.append("=" * 76)
+    lines.append("4b. TAX -- WHY IT COULD NOT STAY OUT OF THE ENGINE")
+    lines.append("=" * 76)
+    lines.append("The README listed tax as absent and called it 'not a small omission'.")
+    lines.append("It is now computed per line, on the POST-DISCOUNT amount.")
+    lines.append("")
+    cart = Cart(lines=(Line("TEE-BLUE", "apparel", 2499, 2, tax_bp=875),
+                       Line("MILK", "grocery", 449, 3, tax_bp=0),
+                       Line("HEADPHONES", "electronics", 8999, 1, tax_bp=875)),
+                shipping_cents=0, customer_segment="regular", day_of_week=2)
+    order20 = Promotion("ORDER-20", Scope.ORDER, EffectKind.PERCENT_OFF,
+                        percent_bp=2000, priority=10)
+    ev = evaluate(cart, [order20])
+    lines.append("Cart: taxable apparel + EXEMPT groceries + taxable electronics,")
+    lines.append("with a single 20%-off-order promotion allocated across all three.")
+    lines.append("")
+    lines.append("%-14s %10s %10s %10s %8s %10s"
+                 % ("line", "gross", "discount", "paid", "tax bp", "tax"))
+    for lr, tx in zip(ev.lines, ev.tax_by_line):
+        lines.append("%-14s %10s %10s %10s %8d %10s"
+                     % (lr.line.sku, fmt(lr.line.subtotal), fmt(-lr.discount_cents),
+                        fmt(lr.paid), lr.line.tax_bp, fmt(tx)))
+    lines.append("%-14s %10s %10s %10s %8s %10s"
+                 % ("TOTAL", fmt(cart.subtotal), fmt(-ev.line_discount_total),
+                    fmt(ev.merchandise_paid), "", fmt(ev.tax_cents)))
+    lines.append("%-14s %43s" % ("TOTAL PAID", fmt(ev.total_paid)))
+    lines.append("")
+    flat = (ev.merchandise_paid * 875 + 5000) // 10000
+    lines.append("A single cart-level rate would have charged %s of tax instead of"
+                 % fmt(flat))
+    lines.append("%s -- a %s error on one cart, because it taxes the exempt"
+                 % (fmt(ev.tax_cents), fmt(flat - ev.tax_cents)))
+    lines.append("groceries. There is no single correct cart rate when the lines")
+    lines.append("differ, which is precisely why the order-level discount has to be")
+    lines.append("ALLOCATED to lines before tax can be computed at all.")
+    lines.append("")
+    lines.append("THAT IS THE LOAD-BEARING CONNECTION between this project and SE-1:")
+    lines.append("the same per-line allocation that makes tax computable is what makes")
+    lines.append("a partial refund computable. Get the allocation wrong and you are")
+    lines.append("wrong twice, in two different systems, months apart.")
+    lines.append("")
+    lines.append("DISCOUNT-THEN-TAX vs TAX-THEN-DISCOUNT is a real choice and this")
+    lines.append("engine has made it: tax applies to what the customer actually pays,")
+    lines.append("because a RETAILER discount reduces the taxable receipt. A")
+    lines.append("MANUFACTURER coupon generally does not -- the retailer is reimbursed,")
+    lines.append("so the taxable amount stays at full price. That case is NOT modelled")
+    lines.append("here, and an engine that has not chosen is doing both by accident.")
+    summary["tax"] = dict(per_line=list(ev.tax_by_line), total_tax=ev.tax_cents,
+                          flat_rate_would_be=flat, total_paid=ev.total_paid)
+
+
+def section_scheduling(lines, summary):
+    lines.append("")
+    lines.append("=" * 76)
+    lines.append("4c. SCHEDULED ACTIVATION AND EXPIRY")
+    lines.append("=" * 76)
+    cart = Cart(lines=(Line("TEE-BLUE", "apparel", 2499, 2),))
+    sale = Promotion("FLASH-FRIDAY", Scope.ORDER, EffectKind.PERCENT_OFF,
+                     eligibility=Eligibility(starts_at=1000.0, ends_at=2000.0),
+                     percent_bp=3000, priority=10)
+    for now, label in ((500.0, "before window"), (1500.0, "inside window"),
+                       (2500.0, "after window")):
+        ev = evaluate(cart, [sale], now=now)
+        reason = dict(ev.rejected).get("FLASH-FRIDAY", "-")
+        lines.append("  t=%6.0f  %-15s total %s   %s"
+                     % (now, label, fmt(ev.total_paid),
+                        "APPLIED" if ev.applied else "rejected: " + reason))
+    lines.append("")
+    lines.append("The window is enforced in the ENGINE, not by a cron job that flips an")
+    lines.append("active flag. That matters because a flag has a moment of being wrong:")
+    lines.append("the job runs late, or runs twice, or the pod that owns it restarts,")
+    lines.append("and a sale goes live early to whoever happens to check out then.")
+    lines.append("Evaluating the timestamp per cart has no such window, and it also")
+    lines.append("makes the merchant simulator able to answer 'what would this cart")
+    lines.append("cost on Friday' -- which is the question they actually ask.")
+    summary["scheduling"] = True
 
 
 def _run_concurrent(promo, n_threads, n_checkouts, locked):
@@ -266,8 +592,12 @@ def main():
     lines, summary = [], {}
     section_trace(lines)
     section_latency(lines, summary)
+    section_index(lines, summary)
     section_budget(lines, summary)
+    section_atomic_budget(lines, summary)
     section_simulator(lines)
+    section_tax(lines, summary)
+    section_scheduling(lines, summary)
     text = "\n".join(lines)
     print(text)
     with open(os.path.join(OUT, "engine_report.txt"), "w", encoding="utf-8") as f:

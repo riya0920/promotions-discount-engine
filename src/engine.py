@@ -57,9 +57,16 @@ def matching_lines(promo: Promotion, cart: Cart) -> list[int]:
     return idx
 
 
-def is_eligible(promo: Promotion, cart: Cart, redemptions: dict[str, int] | None = None
-                ) -> tuple[bool, str]:
+def is_eligible(promo: Promotion, cart: Cart, redemptions: dict[str, int] | None = None,
+                customer_id: str | None = None,
+                per_customer: dict | None = None,
+                now: float | None = None) -> tuple[bool, str]:
     el = promo.eligibility
+    if now is not None:
+        if el.starts_at is not None and now < el.starts_at:
+            return False, "not_yet_active"
+        if el.ends_at is not None and now > el.ends_at:
+            return False, "expired"
     if el.first_order_only and not cart.is_first_order:
         return False, "not_first_order"
     if el.segments and cart.customer_segment not in el.segments:
@@ -77,11 +84,22 @@ def is_eligible(promo: Promotion, cart: Cart, redemptions: dict[str, int] | None
     if redemptions is not None and promo.max_redemptions is not None:
         if redemptions.get(promo.promo_id, 0) >= promo.max_redemptions:
             return False, "budget_exhausted"
+    # PER-CUSTOMER LIMIT. The field existed on Promotion from the start and
+    # nothing read it -- a modelled-but-unenforced rule, which is worse than an
+    # absent one because it reads as implemented.
+    if (promo.per_customer_limit is not None and per_customer is not None
+            and customer_id is not None):
+        used = per_customer.get((promo.promo_id, customer_id), 0)
+        if used >= promo.per_customer_limit:
+            return False, "per_customer_limit_reached"
     return True, ""
 
 
 def resolve_stacking(promos: list[Promotion], cart: Cart,
-                     redemptions: dict[str, int] | None = None):
+                     redemptions: dict[str, int] | None = None,
+                     customer_id: str | None = None,
+                     per_customer: dict | None = None,
+                     now: float | None = None):
     """Greedy in canonical order: exclusivity and stack classes are honoured as
     the merchant configured them, first-come by priority.
 
@@ -97,7 +115,7 @@ def resolve_stacking(promos: list[Promotion], cart: Cart,
     used_classes: set[str] = set()
 
     for p in sorted(promos, key=sort_key):
-        ok, why = is_eligible(p, cart, redemptions)
+        ok, why = is_eligible(p, cart, redemptions, customer_id, per_customer, now)
         if not ok:
             rejected.append((p.promo_id, why))
             continue
@@ -211,9 +229,13 @@ def apply_promo(promo: Promotion, cart: Cart, remaining: list[int],
 
 def evaluate(cart: Cart, promos: list[Promotion],
              redemptions: dict[str, int] | None = None,
-             price_floor_cents: int = 0) -> Evaluation:
-    """The whole pipeline: eligible -> resolve -> apply in canonical order."""
-    accepted, rejected = resolve_stacking(list(promos), cart, redemptions)
+             price_floor_cents: int = 0,
+             customer_id: str | None = None,
+             per_customer: dict | None = None,
+             now: float | None = None) -> Evaluation:
+    """The whole pipeline: eligible -> resolve -> apply in canonical order -> tax."""
+    accepted, rejected = resolve_stacking(list(promos), cart, redemptions,
+                                          customer_id, per_customer, now)
 
     remaining = [ln.subtotal for ln in cart.lines]
     floor = [price_floor_cents * ln.qty for ln in cart.lines]
@@ -231,9 +253,18 @@ def evaluate(cart: Cart, promos: list[Promotion],
         trace.append(frag)
 
     lines = [LineResult(ln, discounts[i]) for i, ln in enumerate(cart.lines)]
+
+    # TAX, per line, on the POST-DISCOUNT amount. Computed last and per line
+    # because the rate differs by line: a cart with taxable electronics and
+    # exempt groceries has no single rate, and an order-level discount allocated
+    # across those lines changes the tax by a different amount on each one.
+    # This is exactly why se1's refund math needs the per-line allocation to be
+    # exact rather than approximate.
+    tax_by_line = tuple(pct_of(lr.paid, lr.line.tax_bp) for lr in lines)
     return Evaluation(lines=lines, shipping_paid_cents=shipping_remaining,
                       trace=trace, applied=[p.promo_id for p in accepted],
-                      rejected=rejected)
+                      rejected=rejected, tax_cents=sum(tax_by_line),
+                      tax_by_line=tax_by_line)
 
 
 def best_of_resolution(cart: Cart, promos: list[Promotion],

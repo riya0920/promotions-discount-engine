@@ -40,6 +40,12 @@ class Line:
     category: str
     unit_price_cents: int
     qty: int
+    # Tax rate in basis points, PER LINE. Not a global: in the US the rate
+    # depends on jurisdiction AND on what the item is -- groceries are commonly
+    # exempt or reduced while the same cart's electronics are not. A single cart
+    # rate is the assumption that makes discount allocation look easy and makes
+    # the totals wrong.
+    tax_bp: int = 0
 
     @property
     def subtotal(self) -> int:
@@ -68,6 +74,11 @@ class Eligibility:
     segments: frozenset[str] = frozenset()        # empty = any
     first_order_only: bool = False
     days_of_week: frozenset[int] = frozenset()    # empty = any
+    # Scheduled activation/expiry as epoch seconds. None = unbounded. A promotion
+    # that a merchant scheduled for Friday must not fire on Thursday, and the
+    # engine -- not a cron job that flips a flag -- is where that is enforced.
+    starts_at: float | None = None
+    ends_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +122,8 @@ class Evaluation:
     trace: list[dict]
     applied: list[str]
     rejected: list[tuple[str, str]]
+    tax_cents: int = 0
+    tax_by_line: tuple = ()
 
     @property
     def line_discount_total(self) -> int:
@@ -122,4 +135,14 @@ class Evaluation:
 
     @property
     def total_paid(self) -> int:
-        return self.merchandise_paid + self.shipping_paid_cents
+        """Merchandise after discount, plus shipping, plus tax.
+
+        TAX IS COMPUTED ON THE POST-DISCOUNT LINE AMOUNT. That ordering is not
+        arbitrary: in the US a retailer discount reduces the taxable receipt
+        (the customer never paid that money), whereas a MANUFACTURER coupon
+        generally does not, because the retailer is reimbursed. This engine
+        implements the retailer-discount case and does not model the
+        manufacturer case at all -- stated here because the difference is real
+        money and an engine that has not chosen is doing both by accident.
+        """
+        return self.merchandise_paid + self.shipping_paid_cents + self.tax_cents
