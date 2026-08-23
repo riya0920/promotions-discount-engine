@@ -1,0 +1,136 @@
+==============================================================================
+SE-2 COMPLETION PASS
+==============================================================================
+
+==============================================================================
+A. CURRENCY -- AND THE ONE THAT BREAKS A CENT-BASED ALLOCATOR
+==============================================================================
+The previous README named this as a BREAKING gap rather than a missing
+feature: 'some currencies have no minor unit at all, which would break
+the cent-based allocator'.
+
+  code    exponent  minor/major          1234567 minor
+  USD            2          100              $12345.67
+  EUR            2          100              €12345.67
+  JPY            0            1               ¥1234567
+  KWD            3         1000             KD1234.567
+  CHF            2          100            CHF12345.67
+
+  The allocator's contract is that the parts sum EXACTLY to the total,
+  in the smallest INDIVISIBLE unit. For USD that is the cent. For JPY
+  there is no cent -- the yen IS the smallest unit -- and for KWD there
+  are a thousand fils to the dinar. An engine that hard-codes two
+  decimal places will happily issue a discount of 12.5 yen, which is not
+  a quantity of money.
+
+  Splitting a 20%% order discount across three lines:
+    USD  discount $20.00         -> $10.00 + $6.67 + $3.33   sums exactly: True
+    JPY  discount ¥2000          -> ¥1000 + ¥667 + ¥333   sums exactly: True
+    KWD  discount KD6.000        -> KD3.000 + KD2.000 + KD1.000   sums exactly: True
+
+  CHF is rounded to 5 rappen at the till, and that is a ROUNDING rule
+  rather than a minor-unit change -- conflating the two leaves an engine
+  unable to represent a legal price. CHF12.37 cash-rounds to CHF12.35, and only the
+  TOTAL is rounded, never the lines: rounding lines and summing gives a
+  total that does not match the printed lines, and a receipt whose lines
+  do not add up is a support call whichever number is right.
+
+  NOT AN FX SYSTEM, and the reason is the interesting part. `convert`
+  takes the rate as an ARGUMENT because the hard question is not where
+  the number comes from but WHEN it is struck: the rate at cart, at
+  authorisation, at capture and at refund are four different numbers,
+  and a refund issued at today's rate on last month's purchase is a loss
+  nobody budgeted for. Forcing the caller to supply it puts that
+  decision somewhere a person owns.
+
+==============================================================================
+B. BEST-OF RESOLUTION WITHOUT THE EXPONENTIAL
+==============================================================================
+A cap is not a solution. The previous `best_of_resolution` searched
+subsets and stopped at 12 eligible promos, returning the best subset it
+happened to see -- a wrong answer that looks like a right one.
+
+   6 promos: fast    0.649 ms -> $99.20      exact     3.632 ms -> $99.20      gap $0.00
+   8 promos: fast    0.466 ms -> $73.24      exact     2.374 ms -> $73.24      gap $0.00
+  10 promos: fast    0.796 ms -> $87.68      exact     9.999 ms -> $87.68      gap $0.00
+  12 promos: fast    0.825 ms -> $55.57      exact   173.245 ms -> $55.57      gap $0.00
+
+  Largest gap against the exact answer: $0.00 over 4 configurations.
+
+  WHY THIS IS LINEAR RATHER THAN EXPONENTIAL. Compatibility here is not
+  an arbitrary graph -- it is a PARTITION. At most one promotion per
+  stacking class may apply, and an EXCLUSIVE promotion applies alone.
+  Choosing at most one member per class is a product of independent
+  choices, so the best combination is the best member of each class,
+  compared against each exclusive on its own.
+
+  WHERE IT IS EXACT AND WHERE IT IS NOT: exact when the promotions do
+  not interact, approximate when they do -- a percentage applied to an
+  already-discounted subtotal is set-dependent, so the best member of
+  one class can change once another applies. That is why the brute-force
+  version is kept and why `verify_against_bruteforce` exists: a fast
+  algorithm whose approximation was never measured is one nobody should
+  trust.
+
+  And the brute force now REFUSES rather than truncating. Raising an
+  error on 13 promotions is worse ergonomics and better engineering than
+  silently returning the best of the first 12.
+
+==============================================================================
+C. PRUNING THE UNIVERSAL BUCKET
+==============================================================================
+The previous index pruned on product scope and spend only, and said so:
+'those would help exactly the universal bucket it currently cannot
+touch'. That bucket is where a broad-match catalogue's cost lives.
+
+    200 promos:   155.6 candidates ->   120.5  (22.5% fewer)
+   1000 promos:   750.9 candidates ->   594.8  (20.8% fewer)
+   3000 promos:  2267.6 candidates ->  1764.0  (22.2% fewer)
+
+  Segment, first-order and day-of-week are CART attributes rather than
+  line attributes, which is exactly why they work where a category index
+  cannot: a universal promotion has no product restriction to index on,
+  but it may still be restricted to VIPs on a Tuesday.
+
+  Every one of these is a NECESSARY condition of eligibility, never a
+  sufficient one. The index may only remove promotions the engine would
+  have rejected anyway; anything stronger changes the answer, and an
+  index that changes the answer is not an optimisation. The equality
+  property test against the unindexed path is what enforces that, and it
+  has caught this exact class of bug before -- 39 wrong answers on 300
+  carts, from indexing order-scoped promos by an unused category field.
+
+==============================================================================
+D. INCREMENTAL EDITS -- AND THE INVARIANT THAT MAKES THEM SAFE
+==============================================================================
+  400 promotions loaded (with persistence)     881.6 ms
+  full index rebuild                            18.9 ms
+  200 edits, persistence + index               1677.1 ms  (8.385 each)
+  200 index updates alone                         4.2 ms  (0.0209 each)
+  index still matches a freshly built one: True
+
+  READ THE LAST TWO ROWS TOGETHER. An edit costs 8.385 ms end to end and
+  0.0209 ms of that is the index -- the rest is the SQLite commit. The
+  incremental index is 905x cheaper than a rebuild; the DURABILITY is
+  what an edit actually costs, and no index strategy changes that.
+
+  Timing them together would have attributed the cost of a commit to
+  the index and made the incremental path look barely worth having.
+
+  A merchant editing ONE promotion should not rebuild a catalogue of
+  two thousand. The cost here is small -- rebuilding is 18.9 ms -- and
+  the SHAPE is the problem: a real console edits continuously, and
+  rebuilding on every save is how it becomes unusable at scale.
+
+  THE CONSISTENCY CHECK IS THE LOAD-BEARING PART. An incrementally
+  maintained index that drifts from its source is worse than no index,
+  because it is confidently wrong rather than absent -- and the symptom,
+  a deleted promotion that keeps firing, is very hard to reproduce. The
+  store owns both the table and the index and updates them in one call,
+  because any arrangement where a caller can write one without the other
+  will eventually be used by someone in a hurry.
+
+  Empty index buckets are dropped on delete. Leaving them behind leaks
+  one entry per SKU ever promoted, which is a slow memory leak that only
+  appears after months of merchandising.
+

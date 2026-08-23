@@ -1,0 +1,99 @@
+{
+  "currency": [
+    {
+      "code": "USD",
+      "exponent": 2,
+      "minor_per_major": 100,
+      "formatted": "$12345.67"
+    },
+    {
+      "code": "EUR",
+      "exponent": 2,
+      "minor_per_major": 100,
+      "formatted": "\u20ac12345.67"
+    },
+    {
+      "code": "JPY",
+      "exponent": 0,
+      "minor_per_major": 1,
+      "formatted": "\u00a51234567"
+    },
+    {
+      "code": "KWD",
+      "exponent": 3,
+      "minor_per_major": 1000,
+      "formatted": "KD1234.567"
+    },
+    {
+      "code": "CHF",
+      "exponent": 2,
+      "minor_per_major": 100,
+      "formatted": "CHF12345.67"
+    }
+  ],
+  "resolution": [
+    {
+      "n_promos": 6,
+      "fast_ms": 0.6489999359473586,
+      "exact_ms": 3.632300067692995,
+      "fast_total": 9920,
+      "exact_total": 9920,
+      "gap": 0,
+      "speedup": 5.5967649093691385
+    },
+    {
+      "n_promos": 8,
+      "fast_ms": 0.46639994252473116,
+      "exact_ms": 2.373900031670928,
+      "fast_total": 7324,
+      "exact_total": 7324,
+      "gap": 0,
+      "speedup": 5.0898377448771885
+    },
+    {
+      "n_promos": 10,
+      "fast_ms": 0.7956000044941902,
+      "exact_ms": 9.999200003221631,
+      "fast_total": 8768,
+      "exact_total": 8768,
+      "gap": 0,
+      "speedup": 12.568124618826154
+    },
+    {
+      "n_promos": 12,
+      "fast_ms": 0.8248999947682023,
+      "exact_ms": 173.2452999567613,
+      "fast_total": 5557,
+      "exact_total": 5557,
+      "gap": 0,
+      "speedup": 210.01976125050575
+    }
+  ],
+  "pruning": [
+    {
+      "catalogue": 200,
+      "candidates_before": 155.58333333333334,
+      "candidates_after": 120.5,
+      "reduction": 0.225495447241564
+    },
+    {
+      "catalogue": 1000,
+      "candidates_before": 750.9333333333333,
+      "candidates_after": 594.8333333333334,
+      "reduction": 0.20787464488636354
+    },
+    {
+      "catalogue": 3000,
+      "candidates_before": 2267.616666666667,
+      "candidates_after": 1763.9666666666667,
+      "reduction": 0.22210544110189112
+    }
+  ],
+  "incremental": {
+    "load_ms": 881.5872999839485,
+    "rebuild_ms": 18.91270000487566,
+    "edits": 200,
+    "edit_ms_each": 8.385310999583453,
+    "consistent": true
+  }
+}

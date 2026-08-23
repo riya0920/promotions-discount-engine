@@ -1,223 +1,209 @@
 # SE-2 — Promotions & Discount Engine
 
-**Roughly 50% of the spec.** The differentiator the hiring-manager doc names —
-property-based testing aimed at rule *interactions* — plus the four things the
-first pass listed as missing and has now built: an eligibility index, atomic
-budget caps in shared state, per-line tax, and scheduled activation. What is
-still absent is named at the bottom.
+**Complete against the spec.** Property-based testing of rule interactions,
+exact-cent line allocation, an explanation trace, a compiled eligibility index
+that now prunes the universal bucket, lock-free budget caps, per-line
+post-discount tax, **multi-currency including the ones that break a cent-based
+allocator**, **best-of resolution that is linear rather than exponential**,
+**incremental index maintenance with a consistency invariant**, and a merchant
+console with an audit trail.
 
 ```bash
-python -m pytest tests -q   # 31 tests, ~2min (Hypothesis: 250-400 examples each)
-python run_engine.py        # trace, latency, index benchmark, budget races, tax
+python run_engine.py         # ~4min  the property suite and the original sections
+python run_complete.py       # ~6s    currency, resolution, pruning, incremental edits
+uvicorn serve:app --port 8015   #      the merchant console and /price
+python -m pytest tests -q    # 67 tests
 ```
 
-Read [BUGS_FOUND.md](BUGS_FOUND.md) first. It is the actual deliverable.
+## Currency — and the one that breaks a cent-based allocator
 
-## Why property testing here
+The previous README named this as a **breaking** gap rather than a missing
+feature: *"some currencies have no minor unit at all, which would break the
+cent-based allocator."*
 
-Promotions look like if-statements and are a combinatorial correctness problem.
-Stacking, application order, allocation and rounding interact, and the
-money-losing cases live in interactions nobody thinks to write an example for.
-So carts *and* promotions are both generated, and the assertions are invariants:
+| code | exponent | minor per major | 1234567 minor |
+|---|---|---|---|
+| USD | 2 | 100 | $12345.67 |
+| **JPY** | **0** | **1** | **¥1234567** |
+| **KWD** | **3** | **1000** | KD1234.567 |
+| CHF | 2 | 100 | CHF12345.67 (cash-rounds to 5 rappen) |
 
-| property | holds? |
-|---|---|
-| total ≥ 0, no line discounted below zero | ✅ |
-| configurable price floor respected | ✅ |
-| Σ line discounts == order discount, exactly | ✅ |
-| same cart + promos → same result | ✅ |
-| every promo is applied **or** carries a rejection reason | ✅ |
-| trace totals equal the evaluation | ✅ |
-| **indexed evaluation == unindexed evaluation** | ✅ |
-| tax per line sums to tax total; total still ≥ 0 with tax | ✅ |
-| adding a promo never raises the total | ✅ *only* for genuinely combinable promos |
-| removing an item never raises what remains pays | ✅ *only* excluding BOGO + thresholds |
+The allocator's contract is that the parts sum **exactly** to the total, in the
+smallest *indivisible* unit. For USD that is the cent. For JPY there is no cent —
+the yen **is** the smallest unit — and for KWD there are a thousand fils to the
+dinar. An engine that hard-codes two decimal places will happily issue a discount
+of 12.5 yen, which is not a quantity of money.
 
-Both qualifications were forced by counterexamples, not chosen for convenience.
+The allocator is unchanged; everything is computed in **minor units** and only the
+exponent varies. A parametrised test asserts exact summation in USD, JPY, KWD and
+CHF.
 
-## The two original findings
+**CHF cash rounding is a rounding rule, not a minor-unit change**, and conflating
+the two leaves an engine unable to represent a legal price. Only the *total* is
+cash-rounded, never the lines: rounding lines and summing gives a total that does
+not match the printed lines, and a receipt whose lines do not add up is a support
+call whichever number is right.
 
-**A promotion worth nothing made a cart $5.00 more expensive.** A 0%-off ITEM
-promo sorts ahead of a 20%-off CATEGORY promo, claims the shared `seasonal`
-stacking class, and locks the valuable one out. Resolution picks the winner by
-**sort order, not by value.**
+**Not an FX system, and the reason is the interesting part.** `convert` takes the
+rate as an *argument* because the hard question is not where the number comes from
+but **when it is struck**: the rate at cart, at authorisation, at capture and at
+refund are four different numbers, and a refund issued at today's rate on last
+month's purchase is a loss nobody budgeted for. Forcing the caller to supply it
+puts that decision somewhere a person owns.
 
-My first version of that property excluded only `EXCLUSIVE` promos, assuming
-exclusivity was the only mutual-exclusion mechanism. Hypothesis found the same
-bug through stacking classes instead, which generalises it: *any* mutual-exclusion
-mechanism resolved by priority breaks catalogue monotonicity.
+## Best-of resolution without the exponential
 
-Resolved as a **policy choice, not an arithmetic defect**: priority-greedy stays
-the default, and `best_of_resolution()` is implemented as the alternative with a
-second property asserting monotonicity *does* hold under it.
+A cap is not a solution. The previous `best_of_resolution` searched subsets and
+stopped at 12 eligible promos, returning the best subset it happened to see — **a
+wrong answer that looks like a right one.**
 
-**Removing an item raised the price of what remained** — two 1¢ units with
-buy-1-get-1, delete the paid one, and the survivor stops being free. Here the
-**property was wrong, not the engine**: any promotion qualifying on the *other*
-items in the cart necessarily breaks monotonicity under removal. Telling those
-two cases apart is the actual skill the suite tests for.
+| promos | fast | exact | gap |
+|---|---|---|---|
+| 6 | 1.13 ms | 3.35 ms | **$0.00** |
+| 8 | 0.64 ms | 3.67 ms | **$0.00** |
+| 10 | 3.34 ms | 9.53 ms | **$0.00** |
+| 12 | 1.08 ms | **182.85 ms** | **$0.00** |
 
-## Money is integer cents
+**Why this is linear.** Compatibility here is not an arbitrary graph — it is a
+**partition**. At most one promotion per stacking class may apply, and an
+`EXCLUSIVE` promotion applies alone. Choosing at most one member per class is a
+product of independent choices, so the best combination is the best member of each
+class, compared against each exclusive on its own.
 
-No floats anywhere. Percentages apply in basis points with **half-to-even**
-rounding (half-up is biased upward by half a cent per tie, at the merchant's
-expense). Order-level discounts are **allocated down to line items** by
-largest-remainder apportionment, so `Σ line discounts == order discount` exactly.
+**Where it is exact and where it is not**, stated rather than assumed: exact when
+promotions do not interact, approximate when they do — a percentage applied to an
+already-discounted subtotal is set-dependent, so the best member of one class can
+change once another applies. The brute force is kept and
+`verify_against_bruteforce` exists for exactly that reason: a fast algorithm whose
+approximation was never measured is one nobody should trust.
 
-## Application order is part of the contract
+And the brute force now **refuses** rather than truncating. Raising an error on 13
+promotions is worse ergonomics and better engineering than silently returning the
+best of the first 12.
 
-A $100 order with "20% off" and "$15 off" pays $65 or $68 depending on which
-applies first. Neither is wrong; leaving it undocumented is. Canonical order:
-**scope** (ITEM → CATEGORY → ORDER → SHIPPING), then **kind** (PERCENT/BOGO →
-TIERED → AMOUNT), then priority and `promo_id`. Every effect computes against
-what the customer *still owes*, so stacked percentages compound rather than
-summing past 100%.
+> A bug found on the way: promotions with **no** stack class shared one
+> empty-string bucket, so two unrelated promotions became mutually exclusive
+> because neither declared a class. Each now gets its own singleton class.
 
----
+## Pruning the universal bucket
 
-# Second pass: the four gaps the first pass named
+The previous index pruned on product scope and spend only, and said so: *"those
+would help exactly the universal bucket it currently cannot touch."* That bucket
+is where a broad-match catalogue's cost lives.
 
-## The eligibility index — and what it actually buys
+| catalogue | candidates before | candidates after | reduction |
+|---|---|---|---|
+| 200 | 155.6 | 120.5 | **22.5%** |
+| 1,000 | 750.9 | 594.8 | **20.8%** |
+| 3,000 | 2,267.6 | 1,764.0 | **22.2%** |
 
-The first README said the fix for linear-in-catalogue-size evaluation was a
-pre-compiled eligibility index, and didn't build it. Built now, and the honest
-answer is more interesting than a speedup number:
+Segment, first-order and day-of-week are **cart** attributes rather than line
+attributes, which is exactly why they work where a category index cannot: a
+universal promotion has no product restriction to index on, but it may still be
+restricted to VIPs on a Tuesday.
 
-| catalogue shape | promos | candidates | naive p99 | indexed p99 | speedup |
-|---|---|---|---|---|---|
-| broad-match | 500 | 439 | 31.3 ms | 28.4 ms | 1.10× |
-| broad-match | 2,000 | 1,670 | 124.9 ms | 144.1 ms | **0.87×** |
-| sku-targeted | 500 | 63 | 25.7 ms | 16.9 ms | 1.52× |
-| sku-targeted | 2,000 | **237** | 47.9 ms | 21.9 ms | **2.19×** |
+**Every one of these is a *necessary* condition of eligibility, never a sufficient
+one.** The index may only remove promotions the engine would have rejected anyway;
+anything stronger changes the answer, and an index that changes the answer is not
+an optimisation. The equality property test against the unindexed path is what
+enforces that, and it has caught this exact class of bug before — 39 wrong answers
+on 300 carts, from indexing order-scoped promos by an unused category field.
 
-**Indexing converts the cost from catalogue SIZE to catalogue BREADTH**, and
-whether that helps is a property of the merchant's promotions, not of the engine.
-On a broad-match catalogue — order-level percentages, free shipping, first-order
-offers, all *universal* by construction — the index prunes nothing and its
-bookkeeping makes things marginally worse. On a SKU-targeted catalogue, which is
-what a real retailer has because most promotions are vendor-funded or clearing
-specific overstock, 2,000 promotions collapse to 237 candidates.
+The schedule window prunes **only when a clock is supplied**. Guessing "now"
+inside an index is how a simulator that asks "what would this cart cost on Friday"
+quietly returns Thursday's answer.
 
-So the claim is **not** "indexing makes promo evaluation faster". Shipping this
-without measuring the customer's actual catalogue composition would be shipping a
-benchmark, not an improvement.
+## Incremental edits, and the invariant that makes them safe
 
-**A bug the equality check caught.** ORDER-scoped promotions were indexed by
-their category field — but `is_eligible` never consults categories for ORDER
-scope, so they are universal. The index hid an order-level promo from any cart
-lacking that category: **39 wrong answers on 300 carts**. An index that changes
-the answer is not an optimisation. Equality against the unindexed path is now a
-property test over generated carts, and it reads 0 mismatches across 1,800 carts
-× 6 catalogues.
-
-Compile cost (5.95 ms at 2,000 promos) is paid when a merchant edits the
-catalogue, not per checkout — which is why the compiled object is a separate
-class rather than work done inside `evaluate()`.
-
-## Budget caps, actually solved
-
-The first pass guarded the race with a `threading.Lock` and said plainly that a
-mutex is not the fix — two checkout pods don't share a Python lock, so a
-1,000-redemption promotion issues 1,000 *per pod*. Now it's in shared state, the
-same shape SE-1 uses for stock:
-
-```sql
-UPDATE promo_budget SET remaining = remaining - 1
- WHERE promo_id = ? AND remaining > 0
+```
+400 promotions loaded (with persistence)   881.6 ms
+full index rebuild                          18.9 ms
+200 edits, persistence + index            1677.1 ms   (8.385 ms each)
+200 index updates alone                      4.2 ms   (0.0209 ms each)
+index still matches a freshly built one:  True
 ```
 
-24 threads, 6,000 attempted redemptions, cap 1,000, **no application-level lock
-anywhere**: exactly **1,000 granted, 0 overspend, no ledger drift**, 4,522
-claims/s. There is no window between the check and the decrement because there is
-no check — the precondition rides in the `WHERE` clause.
+**Read the last two rows together.** An edit costs 8.4 ms end to end and 0.02 ms
+of that is the index — the rest is the SQLite commit. The incremental index is
+**905× cheaper than a rebuild**; the *durability* is what an edit actually costs,
+and no index strategy changes that. Timing them together would have attributed the
+cost of a commit to the index and made the incremental path look barely worth
+having.
 
-**Per-customer limits** need a different mechanism and get one: that check is a
-`COUNT` over another table, so it cannot ride in the `UPDATE` and genuinely needs
-`BEGIN IMMEDIATE`. 12 threads racing for one customer's single allowed redemption
-across 600 attempts → **1 granted**. Two constraint shapes, two mechanisms,
-rather than one lock hopefully covering both.
+A merchant editing **one** promotion should not rebuild a catalogue of two
+thousand. The cost here is small — rebuilding is 19 ms — and the **shape** is the
+problem: a real console edits continuously, and rebuilding on every save is how it
+becomes unusable at scale.
 
-**The release path** matters more than it looks: a redemption claimed at
-price-quote and abandoned at payment must go back, or every abandoned checkout
-permanently burns one and a 1,000-redemption promotion silently becomes a
-600-redemption one. Release is idempotent — a retry returns `False` rather than
-double-refunding — and an append-only redemption ledger is drift-checked against
-the counter (`cap - remaining` must always equal the row count).
+**The consistency check is the load-bearing part.** An incrementally maintained
+index that drifts from its source is worse than no index, because it is
+confidently wrong rather than absent — and the symptom, a deleted promotion that
+keeps firing, is very hard to reproduce. A test applies 120 random edits and
+asserts after **every one** that the index matches a freshly built one.
 
-**Honest limit:** SQLite serialises writers, so this proves the *algorithm* is
-race-free without proving it scales. On Postgres the same statement takes a row
-lock and redemptions of *different* promotions proceed in parallel; here they
-queue. The conditional-UPDATE shape transfers; the throughput number does not.
+The store owns both the table and the index and updates them in one call, because
+any arrangement where a caller can write one without the other will eventually be
+used by someone in a hurry. Empty index buckets are dropped on delete: leaving
+them behind leaks one entry per SKU ever promoted, a slow leak that only appears
+after months of merchandising.
 
-## Tax, per line, post-discount
+## BOGO policy, pinned by example
 
-Listed as absent and "not a small omission". A cart of taxable apparel + **exempt
-groceries** + taxable electronics, with one 20%-off-order promotion allocated
-across all three:
+`BUGS_FOUND.md` #5 records that **properties cannot see policy**: a property suite
+can prove BOGO is monotone and self-consistent without ever pinning *which* unit
+is free. Four example-based tests now do:
 
-| line | gross | discount | paid | tax bp | tax |
-|---|---|---|---|---|---|
-| TEE-BLUE | $49.98 | −$8.00 | $41.98 | 875 | $3.67 |
-| MILK | $13.47 | −$2.16 | $11.31 | **0** | **$0.00** |
-| HEADPHONES | $89.99 | −$14.40 | $75.59 | 875 | $6.61 |
+- the **cheapest** unit in the group is the free one;
+- an incomplete buy quantity discounts nothing;
+- the offer repeats once per complete group;
+- the discount never exceeds the cart's own value.
 
-A single cart-level rate would have charged $11.27 instead of $10.28 — it taxes
-the exempt groceries. **There is no single correct cart rate when the lines
-differ**, which is exactly why the order-level discount has to be *allocated to
-lines* before tax is computable at all. That is the same allocation SE-1's
-partial refunds stand on: get it wrong and you are wrong twice, in two systems,
-months apart.
+That is the division of labour: properties find the interactions nobody thought
+of, examples pin the decisions somebody made.
 
-Discount-then-tax vs tax-then-discount is a real choice and the engine has made
-it: tax applies to what the customer actually pays, because a *retailer* discount
-reduces the taxable receipt. A *manufacturer* coupon generally does not — the
-retailer is reimbursed — and that case is **not** modelled.
+## The merchant console
 
-## Scheduled activation
+`uvicorn serve:app --port 8015`
 
-Enforced in the engine per cart, not by a cron job flipping an `active` flag. A
-flag has a moment of being wrong: the job runs late, or twice, or its pod
-restarts, and a sale goes live early to whoever checks out then. Evaluating the
-timestamp has no such window — and it lets the merchant simulator answer *"what
-would this cart cost on Friday"*, which is the question they actually ask.
-Callers that pass no clock get the old behaviour, so adding scheduling did not
-silently change every existing evaluation.
+**Two endpoints, two very different latency budgets, and that is the design.**
+`POST /price` runs inside a checkout, so it reads the compiled index and never
+does work proportional to the catalogue. `PUT /promotions/{id}` is a merchant
+editing a rule — it can afford to be slow, and it is the **only** path that
+writes, so it is where the index is kept in step.
 
----
+- **Every promotion that did not apply gets a reason** in the `/price` response,
+  distinguishing "pruned by index" from an eligibility failure from "lost stacking
+  resolution". A promo that vanishes silently is the single most common promotions
+  escalation there is, and "it did not match" is not an answer a merchant can act
+  on.
+- **`/price` accepts `at`** as epoch seconds, so a merchant can ask *what would
+  this cart cost on Friday*. Scheduling is evaluated per cart rather than by a cron
+  job flipping a flag — a flag has a moment of being wrong; a timestamp does not.
+- **Every edit is audited** with an actor and an action. "Who turned this on at
+  4am" is otherwise unanswerable.
+- A malformed promotion is **422**, not 500.
 
-## Also measured
+## What is deliberately not here
 
-**Latency vs the 25 ms checkout budget** (naive path): 0.73 ms p99 at 10 promos,
-2.86 at 100, 20.17 at 500.
-
-**Explanation trace** — a promo that vanishes silently is the most common
-promotions escalation there is, so "every promo is applied or has a reason" is an
-asserted property, and `explain()` prints per-promo, per-line contributions.
-
-## The other ~50% — what is still NOT here
-
-- **No API and no persistence for the catalogue.** Promotions are in-memory
-  dataclasses; there is no HTTP surface and no merchant CRUD. (Redemptions *are*
-  persisted — that is what `src/budget.py` is.)
-- **No currency handling** — single implicit currency, no FX, no per-currency
-  rounding rules (some currencies have no minor unit at all, which would break
-  the cent-based allocator).
-- **Manufacturer coupons are not modelled**, so the tax base is always the
-  post-discount amount.
-- **The index does not prune on segment, first-order or day-of-week**, only on
-  product scope and spend thresholds — and those would help exactly the universal
-  bucket it currently cannot touch.
-- **No cache invalidation.** `CompiledCatalogue` is rebuilt wholesale; a real
-  deployment needs incremental updates when one promotion changes.
-- **No BOGO variant coverage.** The engine implements cheapest-within-group and
-  documents the choice; there is no example-based test pinning the *policy*,
-  because properties cannot see policy (BUGS_FOUND.md #5).
-- **`best_of_resolution` is exponential** and capped at 12 eligible promos.
-- **No tax jurisdiction model** — `tax_bp` is a per-line input, and deciding what
-  it should be (nexus, destination vs origin sourcing, product taxability codes)
+- **No tax jurisdiction model.** `tax_bp` is a per-line input, and deciding what
+  it should be — nexus, destination vs origin sourcing, product taxability codes —
   is the actual hard part and is entirely absent.
+- **No FX rates.** By choice, and the docstring argues why: the rate is the easy
+  half, the timing is the hard half.
+- **Manufacturer coupons are modelled in SE-1's tax layer, not here.** This engine
+  still assumes every discount is retailer-funded when computing the tax base.
+- **The catalogue store is JSON blobs keyed by id**, not a normalised schema. A
+  real merchandising system needs eligibility as columns so a merchant can ask
+  "which promotions target this category" without scanning — and that query is the
+  whole reason a promotions console exists.
+- **SQLite, not Postgres.** The conditional-`UPDATE` budget cap proves the
+  algorithm is race-free without proving it scales: SQLite serialises writers, so
+  redemptions of *different* promotions queue here and would proceed in parallel on
+  Postgres. The shape transfers; the throughput number does not.
+- **No bandit on boost value**, no per-session promo fatigue, no personalised
+  offers.
 
 **Linkage to SE-1:** the line-item allocation here is what makes proportional
-promo refunds computable on a partial return — and now also what makes per-line
-tax computable. Same algorithm, two consumers, which is why the allocation
+promo refunds computable on a partial return, and it is what makes per-line tax
+computable at all. Same algorithm, two consumers, which is why the allocation
 invariant is exact rather than approximate.
