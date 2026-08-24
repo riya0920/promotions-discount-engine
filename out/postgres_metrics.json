@@ -1,0 +1,94 @@
+{
+  "cap": [
+    {
+      "engine": "postgres",
+      "promos": 1,
+      "granted": 100,
+      "refused": 540,
+      "consumed": 100,
+      "overspend": 0,
+      "n_errors": 0
+    },
+    {
+      "engine": "sqlite",
+      "promos": 1,
+      "granted": 100,
+      "refused": 540,
+      "consumed": 100,
+      "overspend": 0,
+      "n_errors": 0
+    },
+    {
+      "engine": "postgres",
+      "promos": 8,
+      "granted": 400,
+      "refused": 240,
+      "consumed": 400,
+      "overspend": 0,
+      "n_errors": 0
+    },
+    {
+      "engine": "sqlite",
+      "promos": 8,
+      "granted": 400,
+      "refused": 240,
+      "consumed": 400,
+      "overspend": 0,
+      "n_errors": 0
+    }
+  ],
+  "scaling": {
+    "reps": 15,
+    "sqlite": {
+      "median": 1.0029284038724409,
+      "low": 0.4565104437965954,
+      "high": 1.304932922948178,
+      "ratios": [
+        0.842,
+        1.159,
+        0.84,
+        1.003,
+        1.269,
+        1.17,
+        0.905,
+        1.015,
+        1.164,
+        1.305,
+        0.737,
+        0.879,
+        1.056,
+        0.876,
+        0.457
+      ],
+      "above_one": 8,
+      "n": 15,
+      "p": 1.0
+    },
+    "postgres": {
+      "median": 1.1764520392952862,
+      "low": 0.9410207737506613,
+      "high": 1.5791836148799905,
+      "ratios": [
+        1.027,
+        1.359,
+        1.051,
+        1.128,
+        0.941,
+        1.176,
+        1.263,
+        0.951,
+        1.299,
+        1.339,
+        1.026,
+        1.184,
+        1.433,
+        1.14,
+        1.579
+      ],
+      "above_one": 13,
+      "n": 15,
+      "p": 0.00738525390625
+    },
+    "postgres_scaled_more": 13
+  }
+}

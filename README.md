@@ -12,7 +12,7 @@ console with an audit trail.
 python run_engine.py         # ~4min  the property suite and the original sections
 python run_complete.py       # ~6s    currency, resolution, pruning, incremental edits
 uvicorn serve:app --port 8015   #      the merchant console and /price
-python -m pytest tests -q    # 67 tests
+python -m pytest tests -q    # 75 tests
 ```
 
 ## Currency — and the one that breaks a cent-based allocator
@@ -183,6 +183,55 @@ writes, so it is where the index is kept in step.
   4am" is otherwise unanswerable.
 - A malformed promotion is **422**, not 500.
 
+## Real Postgres — the prediction this project made, tested
+
+Every previous README carried this:
+
+> *"SQLite, not Postgres. The conditional-`UPDATE` budget cap proves the algorithm
+> is race-free without proving it scales: SQLite serialises writers, so
+> redemptions of **different** promotions queue here and would proceed in parallel
+> on Postgres."*
+
+That is a falsifiable claim about another engine, written without one to hand. A
+Postgres binary turned out to be a 297 MB zip away.
+
+```bash
+python run_postgres.py
+```
+
+**The half that was always safe held.** Cap 100, sixteen workers, 640 attempts:
+exactly 100 granted, 540 refused, **overspend 0 on both engines**. `remaining > 0`
+lives in the WHERE clause, so the check and the decrement cannot be separated by a
+scheduler — and this is the first time that has been shown against genuinely
+parallel writers rather than against a queue.
+
+**The half that was an assertion also held, at a smaller size than the phrase
+implies.** One promotion versus sixteen, paired inside each repetition, 15 reps:
+
+| engine | median | range | above 1.0 | sign p |
+|---|---|---|---|---|
+| sqlite | 1.00× | 0.46 – 1.30 | 8/15 | 1.000 |
+| **postgres** | **1.18×** | 0.94 – 1.58 | **13/15** | **0.007** |
+
+Spreading the same redemption storm across sixteen promotions speeds Postgres up
+and does nothing measurable to SQLite — which is exactly what a global write lock
+versus row locks predicts.
+
+> **The obvious statistic was the wrong one.** Testing Postgres against SQLite
+> pairwise reads **p = 0.30** and looks like a null result. It isn't — it's
+> SQLite's noise swamping a real effect, because its runs finish in a fraction of
+> a second and timing jitter is proportionally enormous. Testing each engine
+> against 1.0 separately is the question that was actually being asked.
+
+**"Proceed in parallel" overstates it.** Measured, it is 1.18×, not an order of
+magnitude: at 16 workers the bottleneck is already partly the client.
+
+**And the contrast with SE-1 is the useful part.** The budget cap has *no retry
+loop* — a losing writer waits on a row lock and then succeeds. SE-1's optimistic
+reservation *does* retry, and on the same server it **starves 52% of requests on a
+hot row**. Same database, same kind of contention, opposite outcome. **The
+difference is the retry loop, not the engine.**
+
 ## What is deliberately not here
 
 - **No tax jurisdiction model.** `tax_bp` is a per-line input, and deciding what
@@ -196,10 +245,9 @@ writes, so it is where the index is kept in step.
   real merchandising system needs eligibility as columns so a merchant can ask
   "which promotions target this category" without scanning — and that query is the
   whole reason a promotions console exists.
-- **SQLite, not Postgres.** The conditional-`UPDATE` budget cap proves the
-  algorithm is race-free without proving it scales: SQLite serialises writers, so
-  redemptions of *different* promotions queue here and would proceed in parallel on
-  Postgres. The shape transfers; the throughput number does not.
+- **The engine only runs the budget drill.** `engine.py`, the index and the
+  console still run on SQLite; only the cap was ported, so everything else is
+  still measured on the engine whose limitation the Postgres pass documents.
 - **No bandit on boost value**, no per-session promo fatigue, no personalised
   offers.
 
