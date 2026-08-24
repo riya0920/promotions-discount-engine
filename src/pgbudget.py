@@ -28,8 +28,15 @@ import time
 
 import psycopg
 
+
+# Port 5433 rather than 55432. Windows reserves dynamic TCP ranges (Hyper-V, WSL)
+# and `netsh interface ipv4 show excludedportrange` listed 55400-55499 as excluded
+# partway through this work: the server had bound 55432 BEFORE the reservation
+# existed and could not rebind after a restart, failing with "Permission denied"
+# on both stacks. A port outside every excluded range is the fix; the env var is
+# there so a machine with a different set of reservations can move it again.
 DSN = os.environ.get(
-    "SE2_PG_DSN", "host=127.0.0.1 port=55432 user=postgres dbname=postgres")
+    "SE2_PG_DSN", "host=127.0.0.1 port=5433 user=postgres dbname=postgres")
 
 SCHEMA = """
 DROP TABLE IF EXISTS pg_redemptions;
